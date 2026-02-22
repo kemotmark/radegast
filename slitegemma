@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import json
+import sqlite3
+import math
+from collections import Counter, defaultdict
+import pandas as pd
+import stanza
+import ollama
+
+# --- KONFIGURACJA ---
+DB_FILE = "pkd2.db"
+CSV_FILE = "pkd2.csv"
+MODEL_OLLAMA = "gemma3:4b"
+TOP_K_PER_CHUNK = 10         # Ile wyników pobierać dla jednego chunka
+FINAL_TOP_K = 15             # Ile najlepszych kandydatów przekazać do LLM
+# --------------------
+
+# Parametry chunkowania
+CHUNK_SIZE = 300
+CHUNK_OVERLAP = 50
+MAX_CHUNKS = 5
+
+ALLOWED_UPOS = {"NOUN", "VERB", "ADJ"}
+_NORM_RE = re.compile(r"[^0-9a-ząćęłńóśźż_-]+", re.IGNORECASE)
+
+def normalize_token(t: str) -> str:
+    return _NORM_RE.sub("", t.strip().lower())
+
+# ============================================================
+#  NLP & CHUNKING
+# ============================================================
+
+print("Ładowanie modelu językowego Stanza...")
+try:
+    nlp = stanza.Pipeline(lang="pl", processors="tokenize,pos,lemma", verbose=False)
+except Exception:
+    stanza.download("pl")
+    nlp = stanza.Pipeline(lang="pl", processors="tokenize,pos,lemma", verbose=False)
+
+def chunk_text_smart(text: str, size=300, overlap=50, max_chunks=5) -> list:
+    """
+    Dzieli tekst na fragmenty, starając się nie przecinać słów w połowie.
+    """
+    if not text:
+        return []
+    
+    chunks = []
+    start = 0
+    text_len = len(text)
+    
+    count = 0
+    while start < text_len and count < max_chunks:
+        end = min(start + size, text_len)
+        
+        # Jeśli nie jesteśmy na końcu tekstu, cofnijmy się do ostatniej spacji,
+        # żeby nie uciąć słowa w połowie (ważne dla lematyzacji)
+        if end < text_len:
+            last_space = text.rfind(' ', start, end)
+            if last_space != -1:
+                end = last_space
+        
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+            count += 1
+        
+        # Przesuwamy start uwzględniając overlap
+        # Jeśli chunk był krótszy niż overlap (np. koniec tekstu), kończymy
+        step = len(chunk) - overlap
+        if step <= 0:
+            start += len(chunk) # Unikamy pętli nieskończonej
+        else:
+            start += step
+            
+    return chunks
+
+def get_lemmas_set(text: str) -> set:
+    """Zwraca zbiór unikalnych lematów z tekstu."""
+    if not text: return set()
+    doc = nlp(text)
+    out = set()
+    for sent in doc.sentences:
+        for w in sent.words:
+            if w.upos in ALLOWED_UPOS and w.lemma:
+                tok = normalize_token(w.lemma)
+                if len(tok) >= 2:
+                    out.add(tok)
+    return out
+
+# ============================================================
+#  MIARY I METRYKI
+# ============================================================
+
+class MatchMetrics:
+    @staticmethod
+    def jaccard_similarity(set_a: set, set_b: set) -> float:
+        if not set_a or not set_b: return 0.0
+        return len(set_a & set_b) / len(set_a | set_b)
+
+    @staticmethod
+    def keyword_coverage(query_lemmas: set, doc_lemmas: set) -> float:
+        if not query_lemmas: return 0.0
+        return len(query_lemmas & doc_lemmas) / len(query_lemmas)
+
+# ============================================================
+#  BAZA DANYCH
+# ============================================================
+
+def init_and_import_db():
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
+    
+    if not os.path.exists(CSV_FILE):
+        print(f"Brak pliku {CSV_FILE}")
+        exit(1)
+
+    print(f"Importowanie danych z {CSV_FILE}...")
+    conn = sqlite3.connect(DB_FILE)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS pkd (
+            pkd_code TEXT PRIMARY KEY,
+            opis TEXT,
+            szczegoly TEXT,
+            lemmas TEXT
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS pkd_fts
+            USING fts5(pkd_code, opis, szczegoly, lemmas);
+    """)
+
+    df = pd.read_csv(CSV_FILE)
+    data = []
+    for _, row in df.iterrows():
+        c, d, s = str(row['pkd_code']), str(row['opis']), str(row['szczegoly'])
+        lemmas = " ".join(get_lemmas_set(f"{d} {s}"))
+        data.append((c, d, s, lemmas))
+
+    conn.executemany("INSERT INTO pkd VALUES (?,?,?,?)", data)
+    conn.executemany("INSERT INTO pkd_fts VALUES (?,?,?,?)", data)
+    conn.commit()
+    conn.close()
+    print("Baza gotowa.")
+
+def search_candidates_multichunk(full_text: str):
+    """
+    Wyszukuje kandydatów chunk po chunku i agreguje wyniki.
+    """
+    # 1. Podział na chunki
+    chunks = chunk_text_smart(full_text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP, max_chunks=MAX_CHUNKS)
+    if not chunks:
+        return []
+
+    print(f"\nAnaliza tekstu: podzielono na {len(chunks)} fragmentów (max {MAX_CHUNKS}).")
+
+    # Słownik do agregacji wyników: code -> {data, total_bm25, hits, lemmas}
+    aggregated_candidates = {}
+    
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+
+    # Zbieramy wszystkie lematy usera ze wszystkich chunków do finalnej oceny Jaccarda
+    all_user_lemmas = set()
+
+    # 2. Iteracja po chunkach
+    for i, chunk in enumerate(chunks):
+        chunk_lemmas = get_lemmas_set(chunk)
+        if not chunk_lemmas: continue
+        
+        all_user_lemmas.update(chunk_lemmas)
+        
+        query = " OR ".join(chunk_lemmas)
+        
+        # Zapytanie FTS dla bieżącego chunka
+        rows = conn.execute(f"""
+            SELECT pkd_code, opis, szczegoly, lemmas, bm25(pkd_fts) as score
+            FROM pkd_fts
+            WHERE pkd_fts MATCH ?
+            ORDER BY score
+            LIMIT {TOP_K_PER_CHUNK}
+        """, (query,)).fetchall()
+
+        # Agregacja
+        for r in rows:
+            code = r["pkd_code"]
+            bm25 = r["score"] # FTS zwraca ujemne/małe wartości (im mniejsze tym lepsze w surowym FTS, ale sqlite bm25 jest specyficzny - tutaj traktujemy jako 'weight')
+            
+            # Normalizacja BM25 na potrzeby rankingu (prostym odwróceniem)
+            # W SQLite FTS5 funkcja bm25() zwraca wartość ujemną im lepsze dopasowanie (zazwyczaj).
+            # Dla uproszczenia tutaj sumujemy wagi.
+            
+            if code not in aggregated_candidates:
+                aggregated_candidates[code] = {
+                    "code": code,
+                    "opis": r["opis"],
+                    "szczegoly": r["szczegoly"],
+                    "doc_lemmas_str": r["lemmas"],
+                    "accumulated_score": 0.0,
+                    "chunks_hit": 0
+                }
+            
+            # Bonus za pojawienie się w wynikach + siła dopasowania
+            # Dodajemy 1.0 za sam fakt znalezienia w chunku (głosowanie)
+            # Dodajemy wagę z BM25 (abs, bo FTS zwraca ujemne)
+            aggregated_candidates[code]["accumulated_score"] += (1.0 + abs(bm25))
+            aggregated_candidates[code]["chunks_hit"] += 1
+
+    conn.close()
+
+    # 3. Finalne obliczanie metryk dla zagregowanych kandydatów
+    final_results = []
+    
+    for code, data in aggregated_candidates.items():
+        doc_lemmas = set(data["doc_lemmas_str"].split()) if data["doc_lemmas_str"] else set()
+        
+        # Obliczamy Jaccarda względem CAŁEGO tekstu usera (sumy lematów z chunków)
+        jaccard = MatchMetrics.jaccard_similarity(all_user_lemmas, doc_lemmas)
+        coverage = MatchMetrics.keyword_coverage(all_user_lemmas, doc_lemmas)
+        
+        # Wynik końcowy: Score z chunków * (1 + Jaccard) 
+        # Promujemy te, które często występowały w chunkach I mają wysokie pokrycie słów
+        final_score = data["accumulated_score"] * (1.0 + jaccard)
+
+        final_results.append({
+            "code": code,
+            "opis": data["opis"],
+            "szczegoly": data["szczegoly"],
+            "metrics": {
+                "final_score": round(final_score, 4),
+                "chunks_hit": data["chunks_hit"],
+                "jaccard": round(jaccard, 4),
+                "coverage": round(coverage, 4)
+            }
+        })
+
+    # Sortowanie i cięcie do TOP_K
+    final_results.sort(key=lambda x: x["metrics"]["final_score"], reverse=True)
+    return final_results[:FINAL_TOP_K]
+
+# ============================================================
+#  LLM
+# ============================================================
+
+def ask_ollama(user_desc_full, candidates):
+    if not candidates: return None
+    
+    # Skracamy opis użytkownika do promptu (pierwsze 2 chunki), 
+    # żeby nie zapchać context window, jeśli tekst ma 10 stron.
+    # Logika search_candidates już "przeczytała" całość.
+    short_desc = user_desc_full[:800] + ("..." if len(user_desc_full) > 800 else "")
+
+    candidates_txt = ""
+    for i, c in enumerate(candidates):
+        m = c["metrics"]
+        details_snip = (c['szczegoly'][:100] + "...") if len(c['szczegoly']) > 100 else c['szczegoly']
+        
+        candidates_txt += (
+            f"{i+1}. KOD: {c['code']} (Znaleziono w {m['chunks_hit']} fragmentach tekstu)\n"
+            f"   OPIS: {c['opis']}\n"
+            f"   SZCZEGÓŁY: {details_snip}\n"
+            f"   POKRYCIE SŁÓW: {m['coverage']:.0%}, JACCARD: {m['jaccard']}\n\n"
+        )
+    
+    prompt = f"""
+Jesteś ekspertem PKD. Użytkownik podał długi opis działalności (poniżej fragment).
+Na podstawie analizy słów kluczowych z całego tekstu wybrano kandydatów.
+
+FRAGMENT OPISU UŻYTKOWNIKA:
+"{short_desc}"
+
+LISTA KANDYDATÓW (posortowana wg trafności w fragmentach tekstu):
+{candidates_txt}
+
+Wybierz jeden kod. Jeśli kod pojawił się w wielu fragmentach ("Znaleziono w X fragmentach"), jest to silna przesłanka.
+
+Odpowiedz JSON:
+{{
+    "pkd_code": "Kod",
+    "reason": "Uzasadnienie",
+    "confidence": 0.0-1.0
+}}
+"""
+    print(f"Generowanie odpowiedzi przez {MODEL_OLLAMA}...")
+    try:
+        resp = ollama.chat(model=MODEL_OLLAMA, messages=[{'role': 'user', 'content': prompt}], options={'temperature': 0})
+        # Prosta ekstrakcja JSON
+        content = resp['message']['content']
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        if match: return json.loads(match.group(0))
+        return {"raw": content}
+    except Exception as e:
+        return {"error": str(e)}
+
+# ============================================================
+#  MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    if not os.path.exists(DB_FILE):
+        init_and_import_db()
+    
+    print("\n--- KLASYFIKATOR PKD LONG-TEXT (Chunking enabled) ---")
+    print(f"Konfiguracja: Chunks={MAX_CHUNKS}, Size={CHUNK_SIZE}, Overlap={CHUNK_OVERLAP}")
+
+    while True:
+        try:
+            print("\n" + "-"*50)
+            user_input = input("Wklej (nawet długi) opis działalności: ").strip()
+            if not user_input: continue
+            
+            # 1. Chunking + Search + Aggregation
+            candidates = search_candidates_multichunk(user_input)
+            
+            if not candidates:
+                print("Brak wyników.")
+                continue
+            
+            # Podgląd top 3
+            print(f"\nZnaleziono {len(candidates)} kandydatów. Top 3:")
+            for c in candidates[:3]:
+                m = c['metrics']
+                print(f" - {c['code']} (Hits: {m['chunks_hit']}, Score: {m['final_score']:.2f})")
+
+            # 2. LLM decision
+            result = ask_ollama(user_input, candidates)
+            
+            print("\n=== WYNIK ===")
+            print(json.dumps(result, indent=4, ensure_ascii=False))
+
+        except KeyboardInterrupt:
+            break
