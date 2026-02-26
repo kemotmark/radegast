@@ -1,0 +1,272 @@
+"""
+Analiza działalności firmy na podstawie tekstu ze strony internetowej.
+Używa modelu gemma3:4b przez Ollama + walidacja Pydantic.
+"""
+
+import json
+import ollama
+from enum import Enum
+from typing import Optional
+from pydantic import BaseModel, Field
+
+
+# ── 1. ENUM: typ działalności ────────────────────────────────────────────────
+
+class TypDzialalnosci(str, Enum):
+    PRODUKCJA = "produkcja"
+    USLUGI = "usługi"
+    HANDEL = "handel"
+    PRODUKCJA_I_USLUGI = "produkcja i usługi"
+    NIEZNANE = "nieznane"
+
+
+# ── 2. ENUM: branża ─────────────────────────────────────────────────────────
+
+class Branza(str, Enum):
+    IT = "IT i technologie"
+    BUDOWLANA = "budowlana"
+    SPOZYWCZA = "spożywcza"
+    MOTORYZACYJNA = "motoryzacyjna"
+    MEDYCZNA = "medyczna"
+    FARMACEUTYCZNA = "farmaceutyczna"
+    EDUKACJA = "edukacja"
+    FINANSOWA = "finansowa i bankowa"
+    ENERGETYCZNA = "energetyczna"
+    CHEMICZNA = "chemiczna"
+    MEBLARSKA = "meblarska"
+    ODZIEZOWA = "odzieżowa"
+    ELEKTRONICZNA = "elektroniczna"
+    METALURGICZNA = "metalurgiczna"
+    ROLNICZA = "rolnicza"
+    TRANSPORTOWA = "transportowa i logistyczna"
+    GASTRONOMICZNA = "gastronomiczna"
+    KOSMETYCZNA = "kosmetyczna"
+    NIERUCHOMOSCI = "nieruchomości"
+    TELEKOMUNIKACYJNA = "telekomunikacyjna"
+    ROZRYWKA = "rozrywka i media"
+    TURYSTYKA = "turystyka"
+    PRAWNICZA = "prawnicza"
+    DRUKARSKA = "drukarska i poligraficzna"
+    OPAKOWANIOWA = "opakowaniowa"
+    INNE = "inna"
+    NIEZNANA = "nieznana"
+
+
+# ── 3. MODEL PYDANTIC: wynik analizy ────────────────────────────────────────
+
+class AnalizaFirmy(BaseModel):
+    """Strukturalny wynik analizy działalności firmy."""
+
+    typ_dzialalnosci: TypDzialalnosci = Field(
+        description="Czy firma zajmuje się produkcją, usługami, handlem, czy kombinacją?"
+    )
+
+    produkty_lub_uslugi: list[str] = Field(
+        default_factory=list,
+        description="Lista konkretnych produktów, towarów lub usług oferowanych przez firmę"
+    )
+
+    branza: Branza = Field(
+        description="Branża, w której działa firma"
+    )
+
+    material: Optional[str] = Field(
+        default=None,
+        description="Z jakiego materiału są produkty firmy. None jeśli brak informacji lub firma świadczy usługi"
+    )
+
+    uzasadnienie: str = Field(
+        description="Krótkie uzasadnienie odpowiedzi (1-2 zdania)"
+    )
+
+
+# ── 4. PROMPT SYSTEMOWY ─────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """Jesteś analitykiem biznesowym. Analizujesz teksty ze stron internetowych firm.
+Na podstawie podanego tekstu odpowiedz na pytania o firmę.
+
+Odpowiedz WYŁĄCZNIE poprawnym JSON-em (bez markdown, bez komentarzy) o następującej strukturze:
+
+{
+  "typ_dzialalnosci": "<jedna z wartości: produkcja | usługi | handel | produkcja i usługi | nieznane>",
+  "produkty_lub_uslugi": ["produkt1", "produkt2"],
+  "branza": "<jedna z wartości: IT i technologie | budowlana | spożywcza | motoryzacyjna | medyczna | farmaceutyczna | edukacja | finansowa i bankowa | energetyczna | chemiczna | meblarska | odzieżowa | elektroniczna | metalurgiczna | rolnicza | transportowa i logistyczna | gastronomiczna | kosmetyczna | nieruchomości | telekomunikacyjna | rozrywka i media | turystyka | prawnicza | drukarska i poligraficzna | opakowaniowa | inna | nieznana>",
+  "material": "<materiał lub null jeśli brak informacji>",
+  "uzasadnienie": "<krótkie uzasadnienie>"
+}
+
+ZASADY:
+- Odpowiadaj TYLKO JSON-em
+- Jeśli nie ma informacji o materiale, wpisz null
+- Lista produktów może być pusta jeśli brak danych
+- Bądź precyzyjny i konkretny
+"""
+
+
+# ── 5. FUNKCJA ANALIZY ──────────────────────────────────────────────────────
+
+def analizuj_firme(tekst: str, model: str = "gemma3:4b") -> AnalizaFirmy:
+    """
+    Analizuje tekst ze strony internetowej firmy i zwraca
+    strukturalną odpowiedź na 4 pytania o działalności.
+
+    Args:
+        tekst:  Fragment tekstu ze strony internetowej firmy
+        model:  Nazwa modelu Ollama (domyślnie gemma3:4b)
+
+    Returns:
+        AnalizaFirmy — zwalidowany obiekt Pydantic
+    """
+
+    user_prompt = f"""Przeanalizuj poniższy tekst ze strony internetowej firmy i odpowiedz na pytania:
+
+1. Czy firma produkuje produkty, świadczy usługi, czy zajmuje się handlem?
+2. Jakie konkretne produkty/towary wytwarza lub jakie usługi świadczy?
+3. W jakiej branży działa firma?
+4. Z jakiego materiału są jej produkty? (jeśli brak informacji — null)
+
+TEKST DO ANALIZY:
+\"\"\"
+{tekst}
+\"\"\"
+
+Odpowiedz WYŁĄCZNIE poprawnym JSON-em."""
+
+    # ── Wywołanie Ollama ──
+    print(f"⏳ Wysyłam zapytanie do modelu {model}...")
+
+    response = ollama.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ],
+        options={
+            "temperature": 0.1,       # niska temperatura = deterministyczność
+            "num_predict": 1024,
+            'top_k': 2,        # Ogranicza wybór słów do najbardzie
+        },
+        format="json",                # wymusza output JSON
+    )
+
+    raw_text = response["message"]["content"].strip()
+    print(f"✅ Odpowiedź otrzymana ({len(raw_text)} znaków)\n")
+
+    # ── Parsowanie JSON → Pydantic ──
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        print(f"❌ Błąd parsowania JSON: {e}")
+        print(f"Surowa odpowiedź:\n{raw_text}")
+        raise ValueError(f"Model nie zwrócił poprawnego JSON-a: {e}")
+
+    # Walidacja przez Pydantic
+    wynik = AnalizaFirmy.model_validate(data)
+
+    return wynik
+
+
+# ── 6. ŁADNE WYPISYWANIE WYNIKU ─────────────────────────────────────────────
+
+def wypisz_wynik(wynik: AnalizaFirmy) -> None:
+    """Wypisuje wynik analizy w czytelnej formie."""
+
+    print("=" * 65)
+    print("  📊  ANALIZA DZIAŁALNOŚCI FIRMY")
+    print("=" * 65)
+
+    print(f"""
+  1️⃣  Typ działalności:  {wynik.typ_dzialalnosci.value}
+
+  2️⃣  Produkty / usługi:""")
+    if wynik.produkty_lub_uslugi:
+        for p in wynik.produkty_lub_uslugi:
+            print(f"       • {p}")
+    else:
+        print("       (brak danych)")
+
+    print(f"""
+  3️⃣  Branża:            {wynik.branza.value}
+
+  4️⃣  Materiał:          {wynik.material or 'brak informacji'}
+
+  💬  Uzasadnienie:      {wynik.uzasadnienie}
+""")
+    print("=" * 65)
+
+    # JSON output
+    print("\n📄 JSON:\n")
+    print(wynik.model_dump_json(indent=2, ensure_ascii=False))
+
+
+# ── 7. MAIN ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    # ── Przykładowe teksty do testów ──
+
+    PRZYKŁADY = {
+        "meble": """
+            Firma MebloPol sp. z o.o. jest wiodącym producentem mebli tapicerowanych
+            w Polsce. Od ponad 20 lat wytwarzamy sofy, narożniki, fotele i łóżka
+            tapicerowane. Nasze produkty wykonane są z litego drewna bukowego
+            i wysokiej jakości pianki poliuretanowej, pokryte tkaniną lub skórą
+            naturalną. Eksportujemy do 15 krajów Europy.
+        """,
+
+        "it": """
+            SoftDev Solutions to firma technologiczna specjalizująca się w tworzeniu
+            oprogramowania na zamówienie. Oferujemy usługi programistyczne, projektowanie
+            aplikacji webowych i mobilnych, wdrażanie systemów ERP oraz consulting IT.
+            Nasz zespół liczy 50 inżynierów pracujących w technologiach Python, React
+            i cloud computing. Obsługujemy klientów z sektora finansowego i medycznego.
+        """,
+
+        "piekarnia": """
+            Piekarnia Tradycyjna "U Janka" to rodzinny zakład rzemieślniczy działający
+            od 1985 roku. Wypiekamy chleb na zakwasie, bułki, rogale, ciasta i torty.
+            Używamy wyłącznie naturalnych składników: mąki z lokalnego młyna,
+            masła, jajek od kur z wolnego wybiegu. Codziennie dostarczamy
+            nasze wypieki do 30 sklepów w regionie.
+        """,
+    }
+
+    print("\n🔍 Wybierz przykład lub wpisz własny tekst:\n")
+    print("   [1] Firma meblowa")
+    print("   [2] Firma IT")
+    print("   [3] Piekarnia")
+    print("   [4] Wpisz własny tekst")
+    print()
+
+    wybor = input("Twój wybór (1/2/3/4): ").strip()
+
+    if wybor == "1":
+        tekst = PRZYKŁADY["meble"]
+    elif wybor == "2":
+        tekst = PRZYKŁADY["it"]
+    elif wybor == "3":
+        tekst = PRZYKŁADY["piekarnia"]
+    elif wybor == "4":
+        print("\nWklej tekst ze strony internetowej (zakończ pustą linią):\n")
+        lines = []
+        while True:
+            line = input()
+            if line == "":
+                break
+            lines.append(line)
+        tekst = "\n".join(lines)
+        if not tekst.strip():
+            print("❌ Nie podano tekstu!")
+            exit(1)
+    else:
+        print("❌ Nieprawidłowy wybór!")
+        exit(1)
+
+    print(f"\n📝 Tekst do analizy:\n{tekst.strip()}\n")
+
+    # ── Analiza ──
+    try:
+        wynik = analizuj_firme(tekst)
+        wypisz_wynik(wynik)
+    except Exception as e:
+        print(f"\n❌ Błąd: {e}")
