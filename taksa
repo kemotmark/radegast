@@ -1,0 +1,301 @@
+import argparse
+import json
+import re
+import sys
+import time
+from datetime import datetime
+from typing import Optional
+
+import ollama
+import requests
+from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field
+
+
+# ══════════════════════════════════════════════
+#  LISTA URL-ÓW DO PRZETWORZENIA
+#  ↓↓↓ EDYTUJ TUTAJ ↓↓↓
+# ══════════════════════════════════════════════
+
+URLS = [
+  
+]
+
+
+# ══════════════════════════════════════════════
+#  MODELE PYDANTIC
+# ══════════════════════════════════════════════
+
+class TaryfyResult(BaseModel):
+    taryfa1: Optional[str] = Field(default=None)
+    taryfa2: Optional[str] = Field(default=None)
+    taryfa3: Optional[str] = Field(default=None)
+    taryfa4: Optional[str] = Field(default=None)
+    oplata_dodatkowa: Optional[str] = Field(default=None)
+
+
+class ExtractionResult(BaseModel):
+    url: str
+    status: str
+    text_length: int = 0
+    context: Optional[str] = None
+    taryfy: Optional[TaryfyResult] = None
+    error: Optional[str] = None
+
+
+# ══════════════════════════════════════════════
+#  KONFIGURACJA
+# ══════════════════════════════════════════════
+
+MODEL = "gemma3:4b"
+KEYWORD = "Taryfa"
+CHARS_BEFORE = 200
+CHARS_AFTER = 500
+TIMEOUT = 15
+
+SYSTEM_PROMPT = """Jesteś ekspertem od ekstrakcji danych z polskich stron internetowych.
+Wyciągasz informacje o taryfach i opłatach.
+
+ZAWSZE odpowiadaj WYŁĄCZNIE poprawnym JSON bez dodatkowego tekstu.
+
+Format:
+{
+  "taryfa1": "wartość lub null",
+  "taryfa2": "wartość lub null",
+  "taryfa3": "wartość lub null",
+  "taryfa4": "wartość lub null",
+  "oplata_dodatkowa": "wartość lub null"
+}
+
+Zasady:
+- Brak taryfy w tekście → null
+- Podawaj kwoty z jednostkami (np. "3.20 zł/km")
+- oplata_dodatkowa: wszystkie dodatkowe opłaty, max 200 znaków
+- Szukaj: "Taryfa 1", "Taryfa I", "T1", "taryfa dzienna" itp.
+- Opłaty dodatkowe: bagaż, lotnisko, zwierzęta, postój itp."""
+
+USER_PROMPT = """Przeanalizuj tekst i wyciągnij taryfy oraz opłaty dodatkowe.
+
+=== TEKST ===
+{context}
+=== KONIEC ===
+
+Zwróć TYLKO JSON z polami: taryfa1, taryfa2, taryfa3, taryfa4, oplata_dodatkowa"""
+
+
+# ══════════════════════════════════════════════
+#  POBIERANIE HTML
+# ══════════════════════════════════════════════
+
+def fetch_html(url: str) -> Optional[str]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "pl-PL,pl;q=0.9",
+    }
+    try:
+        print(f"  📡 Pobieram: {url}")
+        resp = requests.get(url, headers=headers, timeout=TIMEOUT)
+        resp.raise_for_status()
+        resp.encoding = resp.apparent_encoding or "utf-8"
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+            tag.decompose()
+
+        text = " ".join(soup.get_text(separator=" ", strip=True).split())
+        print(f"  ✅ Pobrano {len(text)} znaków")
+        return text
+    except Exception as e:
+        print(f"  ❌ Błąd pobierania: {e}")
+        return None
+
+
+# ══════════════════════════════════════════════
+#  EKSTRAKCJA KONTEKSTU
+# ══════════════════════════════════════════════
+
+def extract_context(text: str) -> Optional[str]:
+    if not text:
+        return None
+
+    pattern = re.compile(re.escape(KEYWORD), re.IGNORECASE)
+    matches = list(pattern.finditer(text))
+
+    if not matches:
+        for alt in ["taryf", "cennik", "opłat", "stawka"]:
+            alt_matches = list(re.finditer(alt, text, re.IGNORECASE))
+            if alt_matches:
+                print(f"  🔍 Alternatywa: '{alt}' ({len(alt_matches)}x)")
+                matches = alt_matches
+                break
+
+    if not matches:
+        print(f"  ⚠️  Brak słowa kluczowego, biorę początek tekstu")
+        return text[:700]
+
+    fragments = []
+    used = []
+
+    for m in matches:
+        start = max(0, m.start() - CHARS_BEFORE)
+        end = min(len(text), m.end() + CHARS_AFTER)
+        if any(start < e and end > s for s, e in used):
+            continue
+        fragments.append(text[start:end])
+        used.append((start, end))
+
+    result = "\n---\n".join(fragments)
+    print(f"  📋 {len(fragments)} fragmentów, {len(result)} znaków")
+    return result
+
+
+# ══════════════════════════════════════════════
+#  OLLAMA
+# ══════════════════════════════════════════════
+
+def ask_ollama(context: str) -> Optional[TaryfyResult]:
+    print(f"  🧠 Pytam {MODEL}...")
+    try:
+        response = ollama.chat(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": USER_PROMPT.format(context=context)},
+            ],
+            options={"temperature": 0.1, "num_predict": 512},
+            format="json",
+        )
+        raw = response.message.content.strip()
+        print(f"  📨 Odpowiedź: {raw[:150]}...")
+        return parse_response(raw)
+    except Exception as e:
+        print(f"  ❌ Błąd Ollama: {e}")
+        return None
+
+
+def parse_response(raw: str) -> Optional[TaryfyResult]:
+    try:
+        return TaryfyResult(**json.loads(raw))
+    except Exception:
+        pass
+    m = re.search(r"\{[^{}]+\}", raw, re.DOTALL)
+    if m:
+        try:
+            return TaryfyResult(**json.loads(m.group(0)))
+        except Exception:
+            pass
+    print(f"  ❌ Parsowanie nieudane: {raw[:200]}")
+    return None
+
+
+# ══════════════════════════════════════════════
+#  PIPELINE
+# ══════════════════════════════════════════════
+
+def process_url(url: str) -> ExtractionResult:
+    print(f"\n{'='*60}")
+    print(f"🌐 {url}")
+    print(f"{'='*60}")
+
+    text = fetch_html(url)
+    if not text:
+        return ExtractionResult(url=url, status="error", error="Nie pobrano strony")
+
+    context = extract_context(text)
+    if not context:
+        return ExtractionResult(url=url, status="error", text_length=len(text), error="Brak kontekstu")
+
+    taryfy = ask_ollama(context)
+    if not taryfy:
+        return ExtractionResult(url=url, status="partial", text_length=len(text),
+                                context=context[:300], error="LLM nie zwrócił JSON")
+
+    return ExtractionResult(url=url, status="success", text_length=len(text),
+                            context=context[:300], taryfy=taryfy)
+
+
+# ══════════════════════════════════════════════
+#  TEST
+# ══════════════════════════════════════════════
+
+SAMPLE_TEXT = """
+Cennik usług taxi – od 01.01.2024. Opłata za wsiadanie: 8,00 zł.
+Taryfa 1 (dzienna 6:00-22:00): 3,20 zł/km
+Taryfa 2 (nocna 22:00-6:00): 4,80 zł/km
+Taryfa 3 (świąteczna): 6,40 zł/km
+Taryfa 4 (poza miastem): 4,00 zł/km
+Opłaty dodatkowe: bagaż 10 zł, zwierzęta 15 zł, lotnisko 20 zł, oczekiwanie 40 zł/h
+"""
+
+
+def run_test():
+    print("\n🧪 TRYB TESTOWY\n")
+    context = extract_context(SAMPLE_TEXT)
+    print(f"\nKontekst:\n{context}\n")
+    taryfy = ask_ollama(context)
+    if taryfy:
+        print("\n✅ WYNIK:")
+        print(json.dumps(taryfy.model_dump(), indent=2, ensure_ascii=False))
+    else:
+        print("\n❌ Brak wyniku")
+
+
+# ══════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="Ekstraktor taryf")
+    parser.add_argument("--test", action="store_true", help="Tryb testowy")
+    args = parser.parse_args()
+
+    print("""
+    ╔══════════════════════════════════════╗
+    ║  🚕  EKSTRAKTOR TARYF  v1.0        ║
+    ║  Ollama gemma3:4b + Pydantic        ║
+    ╚══════════════════════════════════════╝
+    """)
+
+    if args.test:
+        run_test()
+        return
+
+    if not URLS:
+        print("❌ Lista URLS jest pusta. Edytuj listę na górze pliku.")
+        sys.exit(1)
+
+    print(f"📋 URL-ów do przetworzenia: {len(URLS)}")
+    for i, u in enumerate(URLS, 1):
+        print(f"   {i}. {u}")
+
+    results = []
+    for i, url in enumerate(URLS):
+        result = process_url(url)
+        results.append(result)
+        if i < len(URLS) - 1:
+            time.sleep(1)
+
+    output = {
+        "timestamp": datetime.now().isoformat(),
+        "total": len(URLS),
+        "success": sum(1 for r in results if r.status == "success"),
+        "results": [r.model_dump(exclude_none=True) for r in results],
+    }
+
+    print(f"\n{'='*60}")
+    print("📊 WYNIKI")
+    print(f"{'='*60}")
+
+    json_str = json.dumps(output, indent=2, ensure_ascii=False)
+    print(json_str)
+
+    with open("wyniki_taryf.json", "w", encoding="utf-8") as f:
+        f.write(json_str)
+    print(f"\n💾 Zapisano: wyniki_taryf.json")
+
+
+if __name__ == "__main__":
+    main()
